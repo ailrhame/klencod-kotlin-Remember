@@ -193,7 +193,7 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             background = bg(0xFF1A1A24.toInt(), 12f)
             setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
-            singleLine = true
+            setSingleLine(true)
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
                 override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) { refreshList() }
@@ -207,7 +207,7 @@ class MainActivity : Activity() {
         }
         listContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            layoutParams = ScrollView.LayoutParams(MATCH, WRAP)
+            layoutParams = FrameLayout.LayoutParams(MATCH, WRAP)
         }
         emptyView = TextView(this).apply {
             text = "لا كلمات بعد\n\nاضغط + لإضافة أول كلمة"
