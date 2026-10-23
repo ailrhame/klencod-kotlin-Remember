@@ -11,14 +11,17 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.AudioManager
+import android.media.AudioAttributes
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.text.Editable
@@ -144,6 +147,22 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
         }
         buildMainUI()
+        ensureServiceState()
+    }
+
+    private fun ensureServiceState() {
+        if (Store.speakOnUnlock(this)) startSpeakService() else stopSpeakService()
+    }
+
+    private fun startSpeakService() {
+        val i = Intent(this, SpeakService::class.java)
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        } catch (_: Exception) {}
+    }
+
+    private fun stopSpeakService() {
+        try { stopService(Intent(this, SpeakService::class.java)) } catch (_: Exception) {}
     }
 
     private fun dp(v: Float): Int = (v * resources.displayMetrics.density).toInt()
@@ -417,7 +436,10 @@ class MainActivity : Activity() {
             text = "النطق عند فتح القفل"
             setTextColor(0xFFF0EAD6.toInt())
             isChecked = Store.speakOnUnlock(ctx)
-            setOnCheckedChangeListener { _, b -> Store.setSpeakOnUnlock(ctx, b) }
+            setOnCheckedChangeListener { _, b ->
+                Store.setSpeakOnUnlock(ctx, b)
+                if (b) startSpeakService() else stopSpeakService()
+            }
             setPadding(0, dp(8f), 0, dp(8f))
         }
         ll.addView(sw)
@@ -467,6 +489,20 @@ class MainActivity : Activity() {
             setOnClickListener { speakAdhoc("اختبار", "Test OK") }
         }
         ll.addView(testBtn, LinearLayout.LayoutParams(MATCH, WRAP).also { it.topMargin = dp(10f) })
+
+        val batteryBtn = Button(ctx).apply {
+            text = "إلغاء تحسين البطارية (مهم للاستقرار)"
+            setOnClickListener {
+                try {
+                    val i = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(i)
+                } catch (_: Exception) {
+                    Toast.makeText(ctx, "غير متاح على هذا الجهاز", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        ll.addView(batteryBtn, LinearLayout.LayoutParams(MATCH, WRAP).also { it.topMargin = dp(8f) })
 
         val clearBtn = Button(ctx).apply {
             text = "حذف كل الكلمات"
@@ -550,67 +586,88 @@ class SpeakService : Service(), TextToSpeech.OnInitListener {
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var prevVolume = -1
-    private var pendingEntry: WordEntry? = null
 
     @Volatile
     private var sessionId = 0
+
+    private var pendingEntry: WordEntry? = null
+    private var pendingStopAfter = false
+
+    private val unlockReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_USER_PRESENT) return
+            if (!Store.speakOnUnlock(this@SpeakService)) return
+            val list = Store.all(this@SpeakService)
+            if (list.isEmpty()) return
+            speak(list.random(), stopAfter = false)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
         try {
-            startForeground(NOTIF_ID, buildNotification())
-        } catch (_: Exception) {}
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, buildNotification())
+            }
+        } catch (_: Exception) {
+            try { startForeground(NOTIF_ID, buildNotification()) } catch (_: Exception) {}
+        }
 
         try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            prevVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-            val maxV = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val target = (Store.volume(this) * maxV).toInt().coerceIn(0, maxV)
-            am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            registerReceiver(unlockReceiver, IntentFilter(Intent.ACTION_USER_PRESENT))
         } catch (_: Exception) {}
 
-        tts = TextToSpeech(this, this)
+        tts = TextToSpeech(this, this).apply {
+            try {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+            } catch (_: Exception) {}
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val w = intent?.getStringExtra("word")
         val m = intent?.getStringExtra("meaning")
-        val e: WordEntry? = if (w != null && m != null) {
-            WordEntry("adhoc", w, m, 0L)
-        } else {
-            val list = Store.all(this)
-            if (list.isEmpty()) null else list.random()
+        if (w != null && m != null) {
+            val entry = WordEntry("adhoc", w, m, 0L)
+            val stopAfter = !Store.speakOnUnlock(this)
+            speak(entry, stopAfter = stopAfter)
         }
-        if (e == null) {
-            finishService()
-            return START_NOT_STICKY
-        }
-        pendingEntry = e
-        if (ttsReady) speakNow(e)
-        return START_NOT_STICKY
+        return if (Store.speakOnUnlock(this)) START_STICKY else START_NOT_STICKY
     }
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS && tts != null) {
-            ttsReady = true
+        ttsReady = status == TextToSpeech.SUCCESS && tts != null
+        if (ttsReady) {
             val e = pendingEntry
-            if (e != null) speakNow(e) else finishService()
-        } else {
-            finishService()
+            val s = pendingStopAfter
+            pendingEntry = null
+            pendingStopAfter = false
+            if (e != null) speak(e, s)
         }
     }
 
-    private fun speakNow(e: WordEntry) {
-        val t = tts ?: run { finishService(); return }
+    private fun speak(e: WordEntry, stopAfter: Boolean) {
+        if (!ttsReady) {
+            pendingEntry = e
+            pendingStopAfter = stopAfter
+            return
+        }
+        val t = tts ?: return
 
         val mySession = ++sessionId
+        val repeat = Store.repeat(this).coerceAtLeast(1)
+        val total = repeat * 2
+        var done = 0
 
-        try {
-            t.setPitch(Store.pitch(this))
-            t.setSpeechRate(Store.speed(this))
-        } catch (_: Exception) {}
+        try { t.setPitch(Store.pitch(this)); t.setSpeechRate(Store.speed(this)) } catch (_: Exception) {}
 
         val lang = Store.lang(this)
         try {
@@ -623,33 +680,31 @@ class SpeakService : Service(), TextToSpeech.OnInitListener {
                 t.setLanguage(Locale.getDefault())
             }
         } catch (_: Exception) {
-            t.setLanguage(Locale.getDefault())
+            try { t.setLanguage(Locale.getDefault()) } catch (_: Exception) {}
         }
 
-        val repeat = Store.repeat(this).coerceAtLeast(1)
-        val total = repeat * 2
-        var done = 0
+        val vol = Store.volume(this).coerceIn(0f, 1f)
+        val params = Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, vol)
+        }
 
         val listener = object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
-
             override fun onDone(utteranceId: String?) {
                 if (mySession != sessionId) return
                 done++
-                if (done >= total) finishService()
+                if (done >= total && stopAfter) stopSelf()
             }
-
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
                 if (mySession != sessionId) return
                 done++
-                if (done >= total) finishService()
+                if (done >= total && stopAfter) stopSelf()
             }
-
             override fun onError(utteranceId: String?, errorCode: Int) {
                 if (mySession != sessionId) return
                 done++
-                if (done >= total) finishService()
+                if (done >= total && stopAfter) stopSelf()
             }
         }
         t.setOnUtteranceProgressListener(listener)
@@ -657,34 +712,38 @@ class SpeakService : Service(), TextToSpeech.OnInitListener {
         var id = 0
         for (i in 0 until repeat) {
             val mode = if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            t.speak(e.word, mode, null, "u${id++}")
+            t.speak(e.word, mode, params, "u${id++}")
         }
         for (i in 0 until repeat) {
-            t.speak(e.meaning, TextToSpeech.QUEUE_ADD, null, "u${id++}")
+            t.speak(e.meaning, TextToSpeech.QUEUE_ADD, params, "u${id++}")
         }
     }
 
-    private fun finishService() {
-        try {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } catch (_: Exception) {
-            try { @Suppress("DEPRECATION") stopForeground(true) } catch (_: Exception) {}
-        }
-        stopSelf()
+    override fun onDestroy() {
+        try { unregisterReceiver(unlockReceiver) } catch (_: Exception) {}
+        try { tts?.stop() } catch (_: Exception) {}
+        try { tts?.shutdown() } catch (_: Exception) {}
+        tts = null
+        super.onDestroy()
     }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildNotification(): Notification {
         val contentIntent = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        return Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Remember")
-            .setContentText("جارٍ نطق الكلمة والمعنى...")
+            .setContentText("جاهز للنطق عند فتح القفل")
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(contentIntent)
             .setOngoing(true)
-            .build()
+        if (Build.VERSION.SDK_INT >= 31) {
+            try { builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE) } catch (_: Exception) {}
+        }
+        return builder.build()
     }
 
     private fun createChannel() {
@@ -694,28 +753,12 @@ class SpeakService : Service(), TextToSpeech.OnInitListener {
             nm.createNotificationChannel(ch)
         } catch (_: Exception) {}
     }
-
-    override fun onDestroy() {
-        if (prevVolume >= 0) {
-            try {
-                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, prevVolume, 0)
-            } catch (_: Exception) {}
-        }
-        try { tts?.stop() } catch (_: Exception) {}
-        try { tts?.shutdown() } catch (_: Exception) {}
-        tts = null
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
 }
 
-class UnlockReceiver : BroadcastReceiver() {
+class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_USER_PRESENT) return
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         if (!Store.speakOnUnlock(context)) return
-        if (Store.all(context).isEmpty()) return
         val svc = Intent(context, SpeakService::class.java)
         try {
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(svc)
